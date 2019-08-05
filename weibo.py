@@ -3,6 +3,7 @@
 
 import functools
 import json
+import logging
 import math
 import random
 import sys
@@ -11,13 +12,26 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from itertools import chain, zip_longest
-from pathlib import Path
 from time import sleep
 from typing import SupportsInt
 
 import pandas as pd
 import requests
 from lxml import etree
+from tqdm.auto import tqdm
+
+logger = logging.getLogger(__name__)
+
+
+class JSONHandler(logging.Handler):
+    def __init__(self, stream, level=logging.NOTSET):
+        super().__init__(level)
+        self.stream = stream
+
+    def emit(self, record):
+        json.dump(vars(record), self.stream, ensure_ascii=False)
+        self.stream.write('\n')
+        self.stream.flush()
 
 
 class random_sleep:
@@ -60,6 +74,7 @@ class UserWeibo:
     _iter: bool = field(default=False, repr=False)
 
     API_URL = 'https://m.weibo.cn/api/container/getIndex'
+    ANTI_CRAWLER_SLEEP_TIME = 600
 
     @classmethod
     def from_id(cls, id):
@@ -85,8 +100,14 @@ class UserWeibo:
     @classmethod
     def _get_json(cls, params):
         """获取网页中json数据"""
-        r = requests.get(cls.API_URL, params=params)
-        return r.json()
+        while True:
+            r = requests.get(cls.API_URL, params=params)
+            if r.status_code == 418:
+                logger.info('Got status code 418, sleep for '
+                            f'{cls.ANTI_CRAWLER_SLEEP_TIME} seconds')
+                sleep(cls.ANTI_CRAWLER_SLEEP_TIME)
+            else:
+                return r.json()
 
     @random_sleep(freq=(1, 5), time=(6, 10))
     def _get_page(self, page):
@@ -107,7 +128,8 @@ class UserWeibo:
     def _get_pics(weibo_info):
         """获取微博原始图片url"""
         pic_info = weibo_info.get('pics', [])
-        return [pic['large']['url'] for pic in pic_info]
+        return [{'url': pic['large']['url'],
+                 'thumbnail': pic['url']} for pic in pic_info]
 
     @staticmethod
     def _get_topics(selector):
@@ -211,10 +233,13 @@ class UserWeibo:
         if self._iter and self.page >= len(self):
             raise StopIteration()
 
-        response = self._get_page(self.page)
         self.page += 1
+        response = self._get_page(self.page)
         if not response['ok']:
-            return
+            logger.warn(f'Page {self.page:,d} is not avialable.',
+                        extra={'response': response,
+                               'page': self.page, 'uid': self.id})
+            return []
 
         weibos = response['data']['cards']
         page = [self._parse_weibo(wb['mblog'])
@@ -228,16 +253,24 @@ class UserWeibo:
 
 def save_user_weibos(uids, f):
     users = [UserWeibo.from_id(uid) for uid in uids]
+    for user in users:
+        logger.info(f'Get user {user.name!r} with {len(user):,d} pages',
+                    extra={'user': {'id': user.id, 'name': user.name,
+                                    'len': len(user)}})
+
+    pbar = tqdm(total=max(map(len, users)))
     try:
-        for n, pages in enumerate(zip_longest(*users, fillvalue=[]), 1):
+        for pages in zip_longest(*users, fillvalue=[]):
             weibos = (weibo for page in pages for weibo in page)
             for weibo in weibos:
                 json.dump(weibo, f,
                           ensure_ascii=False,
                           default=datetime.isoformat)
                 f.write('\n')
-    except KeyboardInterrupt:
-        print(f'\rInterrupted at page {n}')
+            pbar.update()
+    finally:
+        logger.info('\r')
+        logger.info(f'Stopped at page {pbar.n}')
 
 
 def main():
@@ -252,8 +285,20 @@ def main():
                     help='Path to a txt file with a user id per line.')
     ap.add_argument('-out', type=FileType('w'), default=sys.stdout,
                     help='Path to store output (*.jsonl), default to stdout')
+    ap.add_argument('-log-level', '-l', choices=logging._levelToName.values(),
+                    default='INFO', help='Log level, default to "INFO"')
+    ap.add_argument('-json-logs', '-j', type=FileType('a+'),
+                    default=sys.stderr, help='Output json logs path (*.jsonl)')
     args = ap.parse_args()
-    uids = chain(args.id, args.csv.id, args.txt)
+
+    uids = list(chain(args.id, args.csv.id, args.txt))
+
+    logging.basicConfig(level=args.log_level)
+    logger.addHandler(JSONHandler(args.json_logs))
+
+    config = {'uid': uids, 'out': args.out.name}
+    logger.info('Crawler Started', extra={'config': config})
+
     save_user_weibos(uids, args.out)
 
 
